@@ -116,56 +116,6 @@ class SwipeCard extends LitElement {
     }
   }
 
-  _resolveStartIndex(cardCount) {
-    if (cardCount <= 0) {
-      return 0;
-    }
-    const rawStartCard = Number.parseInt(this._config?.start_card, 10);
-    if (!Number.isFinite(rawStartCard)) {
-      return 0;
-    }
-    return Math.min(Math.max(rawStartCard, 1), cardCount) - 1;
-  }
-
-  _buildCardLoadOrder(cardCount) {
-    if (cardCount <= 0) {
-      return [];
-    }
-    const startIndex = this._resolveStartIndex(cardCount);
-    const order = [];
-    const used = new Set();
-
-    const add = (index) => {
-      if (index < 0 || index >= cardCount || used.has(index)) {
-        return;
-      }
-      used.add(index);
-      order.push(index);
-    };
-
-    add(startIndex);
-    add(startIndex - 1);
-    add(startIndex + 1);
-    add(0);
-    add(cardCount - 1);
-
-    for (let distance = 2; used.size < cardCount; distance += 1) {
-      add(startIndex + distance);
-      add(startIndex - distance);
-    }
-
-    return order;
-  }
-
-  _createPlaceholderSlide() {
-    const placeholder = document.createElement("div");
-    placeholder.className = "swiper-slide";
-    if ("card_width" in this._config) {
-      placeholder.style.width = this._config.card_width;
-    }
-    return placeholder;
-  }
-
   set hass(hass) {
     this._hass = hass;
 
@@ -389,30 +339,108 @@ class SwipeCard extends LitElement {
     const cardCount = Array.isArray(this._config?.cards)
       ? this._config.cards.length
       : 0;
+    const isLoopEnabled = this._parameters?.loop === true;
 
-    this._cards = Array.from({ length: cardCount }, () =>
-      this._createPlaceholderSlide()
-    );
+    const createPlaceholderSlide = () => {
+      const placeholder = document.createElement("div");
+      placeholder.className = "swiper-slide";
+      if ("card_width" in this._config) {
+        placeholder.style.width = this._config.card_width;
+      }
+      return placeholder;
+    };
 
-    await this.updateComplete;
+    const waitForIdle = () =>
+      new Promise((resolve) => {
+        if (typeof window.requestIdleCallback === "function") {
+          window.requestIdleCallback(() => resolve(), { timeout: 140 });
+        } else {
+          window.setTimeout(resolve, 0);
+        }
+      });
 
-    const loadOrder = this._buildCardLoadOrder(cardCount);
-    let loadedCount = 0;
+    const loadAllCards = async () => {
+      const cards = await Promise.all(
+        this._config.cards.map((config) => this._createCardElement(config))
+      );
 
-    const progressiveLoad = async () => {
-      for (const index of loadOrder) {
-        if (runId !== this._createCardsRunId) {
+      if (runId !== this._createCardsRunId) {
+        return;
+      }
+
+      this._cards = cards;
+      await this.updateComplete;
+
+      if (this._ro) {
+        cards.forEach((cardEl) => this._ro.observe(cardEl));
+      }
+    };
+
+    const loadNonLoopCardsFast = async () => {
+      if (cardCount === 0) {
+        this._cards = [];
+        return;
+      }
+
+      const rawStartCard = Number.parseInt(this._config?.start_card, 10);
+      const startIndex = Number.isFinite(rawStartCard)
+        ? Math.min(Math.max(rawStartCard, 1), cardCount) - 1
+        : 0;
+
+      const order = [];
+      const used = new Set();
+      const add = (index) => {
+        if (index < 0 || index >= cardCount || used.has(index)) {
+          return;
+        }
+        used.add(index);
+        order.push(index);
+      };
+
+      add(startIndex);
+      add(startIndex - 1);
+      add(startIndex + 1);
+      for (let distance = 2; used.size < cardCount; distance += 1) {
+        add(startIndex + distance);
+        add(startIndex - distance);
+      }
+
+      this._cards = Array.from({ length: cardCount }, () =>
+        createPlaceholderSlide()
+      );
+      await this.updateComplete;
+
+      if (runId !== this._createCardsRunId) {
+        return;
+      }
+
+      let scheduledRefresh = undefined;
+      const scheduleRefresh = () => {
+        if (scheduledRefresh) {
+          return;
+        }
+        scheduledRefresh = window.setTimeout(() => {
+          scheduledRefresh = undefined;
+          if (runId === this._createCardsRunId) {
+            this._queueSwiperRefresh();
+          }
+        }, 120);
+      };
+
+      const clearScheduledRefresh = () => {
+        if (scheduledRefresh) {
+          window.clearTimeout(scheduledRefresh);
+          scheduledRefresh = undefined;
+        }
+      };
+
+      const loadCardAt = async (index) => {
+        const currentSlide = this._cards[index];
+        if (!currentSlide || typeof currentSlide.setConfig === "function") {
           return;
         }
 
-        const currentSlide = this._cards[index];
-        if (!currentSlide || typeof currentSlide.setConfig === "function") {
-          continue;
-        }
-
-        const config = this._config.cards[index];
-        const cardEl = await this._createCardElement(config);
-
+        const cardEl = await this._createCardElement(this._config.cards[index]);
         if (runId !== this._createCardsRunId) {
           return;
         }
@@ -424,20 +452,36 @@ class SwipeCard extends LitElement {
           this._ro.unobserve(currentSlide);
           this._ro.observe(cardEl);
         }
-
         this._cards[index] = cardEl;
-        loadedCount += 1;
+      };
 
-        // Prioritize first paint and then refresh in small batches.
-        if (loadedCount <= 3 || loadedCount % 3 === 0 || loadedCount === cardCount) {
-          this._queueSwiperRefresh();
+      const firstBatchSize = Math.min(3, order.length);
+      await Promise.all(order.slice(0, firstBatchSize).map(loadCardAt));
+      if (runId !== this._createCardsRunId) {
+        clearScheduledRefresh();
+        return;
+      }
+
+      this._queueSwiperRefresh();
+
+      const remaining = order.slice(firstBatchSize);
+      const backgroundBatchSize = 2;
+      while (remaining.length > 0) {
+        if (runId !== this._createCardsRunId) {
+          clearScheduledRefresh();
+          return;
         }
 
-        await new Promise((resolve) => window.requestAnimationFrame(resolve));
+        const batch = remaining.splice(0, backgroundBatchSize);
+        await Promise.all(batch.map(loadCardAt));
+        scheduleRefresh();
+        await waitForIdle();
       }
+
+      clearScheduledRefresh();
     };
 
-    this._cardPromises = progressiveLoad();
+    this._cardPromises = isLoopEnabled ? loadAllCards() : loadNonLoopCardsFast();
     await this._cardPromises;
 
     if (this.swiper) {
